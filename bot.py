@@ -1,6 +1,7 @@
 import os, requests, time
 from bs4 import BeautifulSoup
 import yfinance as yf
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -8,26 +9,23 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 URL = os.environ.get('SCREENER_URL')
 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-def send_telegram(text):
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                  json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+def send_telegram_photo(photo_path, caption):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    with open(photo_path, 'rb') as photo:
+        requests.post(url, data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"}, files={"photo": photo})
 
 def main():
-    print("Starting scraper...")
+    print("Scraping Screener...")
     stocks = []
     seen = set()
     page = 1
     
-    # 1. Scrape all pages dynamically (No Limits)
     while True:
-        print(f"Fetching page {page}...")
         res = requests.get(f"{URL}?page={page}", headers=headers)
         if res.status_code != 200: break
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         table = soup.find('table')
         if not table: break
-        
         rows = table.find('tbody').find_all('tr')
         if not rows: break
         
@@ -45,56 +43,69 @@ def main():
         page += 1
         time.sleep(0.5)
 
-    print(f"Found {len(stocks)} total stocks.")
-    
     if not stocks:
-        send_telegram("No stocks found. Check if your Screener URL is Public.")
         return
 
-    industry_counts = {}
+    print("Analyzing Sectors and Volume Surges...")
     details = []
-    
-    # 2. Use Yahoo Finance for ALL stocks (No limits)
-    # Using a custom session prevents Yahoo from blocking the bot
+    sector_counts = {}
     session = requests.Session()
     session.headers.update(headers)
     
     for i, stock in enumerate(stocks):
         try:
-            # Try NSE first (.NS)
-            ticker_obj = yf.Ticker(f"{stock['Ticker']}.NS", session=session)
-            industry = ticker_obj.info.get('industry', 'Unknown')
+            info = yf.Ticker(f"{stock['Ticker']}.NS", session=session).info
+            sector = info.get('sector', 'Unknown')
+            if sector == 'Unknown':
+                info = yf.Ticker(f"{stock['Ticker']}.BO", session=session).info
+                sector = info.get('sector', 'Unknown')
             
-            # Fallback for BSE-only stocks (.BO)
-            if industry == 'Unknown':
-                ticker_obj = yf.Ticker(f"{stock['Ticker']}.BO", session=session)
-                industry = ticker_obj.info.get('industry', 'Unknown')
-                
+            # Calculate Volume Surge (Today's Vol / Avg Vol)
+            vol = info.get('volume', 0)
+            avg_vol = info.get('averageVolume', 1)
+            surge = round(vol / avg_vol, 1) if avg_vol and avg_vol > 0 else 0
+            
         except:
-            industry = 'Unknown'
+            sector, surge = 'Unknown', 0
             
-        if industry != 'Unknown':
-            industry_counts[industry] = industry_counts.get(industry, 0) + 1
-            stock['Industry'] = industry
+        if sector != 'Unknown':
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            stock['Sector'] = sector
+            stock['Surge'] = surge
             details.append(stock)
             
-        if (i + 1) % 10 == 0:
-            print(f"Processed {i + 1}/{len(stocks)} stocks...")
-            
-        time.sleep(0.2) # Fast but safe delay
+        time.sleep(0.2)
 
-    print("Formatting message...")
-    sorted_ind = sorted(industry_counts.items(), key=lambda x: x[1], reverse=True)
-    msg = f"*Sector Breakout Heat-Map*\n_{datetime.now().strftime('%d %b %Y')}_\nTotal Breakouts: {len(stocks)}\n\n"
+    # 1. Create the Visual Chart Image
+    print("Drawing Chart...")
+    sorted_sec = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    sectors = [x[0] for x in sorted_sec]
+    counts = [x[1] for x in sorted_sec]
     
-    # 3. Clean text formatting (No Emojis)
-    for ind, count in sorted_ind[:5]:
-        msg += f"*{ind}* ({count} stocks)\n"
-        examples = [s['Name'] for s in details if s['Industry'] == ind][:3]
-        msg += f"   - {', '.join(examples)}\n\n"
+    plt.figure(figsize=(10, 6))
+    plt.barh(sectors[::-1], counts[::-1], color='#4C72B0')
+    plt.xlabel('Number of Breakout Stocks')
+    plt.title(f'Sector Heat-Map - {datetime.now().strftime("%d %b %Y")}')
+    plt.tight_layout()
+    plt.savefig('heatmap.png')
+
+    # 2. Format the Actionable Caption
+    print("Formatting Actionable Data...")
+    caption = f"📊 *Macro Sector Heat-Map*\nTotal Breakouts: {len(stocks)}\n\n"
+    
+    # Sort stocks by volume surge to find the true leaders
+    details.sort(key=lambda x: x['Surge'], reverse=True)
+    
+    for sec, count in sorted_sec[:5]:
+        caption += f"🔥 *{sec}* ({count} stocks)\n"
+        # Find top 2 stocks in this sector by volume surge
+        leaders = [s for s in details if s['Sector'] == sec][:2]
+        for leader in leaders:
+            caption += f"   - {leader['Name']} (Vol Surge: {leader['Surge']}x)\n"
+        caption += "\n"
         
-    print("Sending text to Telegram...")
-    send_telegram(msg)
+    print("Sending Image to Telegram...")
+    send_telegram_photo('heatmap.png', caption)
     print("Done!")
 
 if __name__ == "__main__":
